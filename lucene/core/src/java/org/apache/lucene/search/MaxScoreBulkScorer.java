@@ -52,6 +52,7 @@ final class MaxScoreBulkScorer extends BulkScorer {
   private OffsetBits filterMatchesBits = null;
 
   private final DocAndFloatFeatureBuffer docAndScoreBuffer = new DocAndFloatFeatureBuffer();
+  private DocAndFloatFeatureBuffer secondDocAndScoreBuffer;
   private final DocAndScoreAccBuffer docAndScoreAccBuffer = new DocAndScoreAccBuffer();
 
   MaxScoreBulkScorer(int maxDoc, List<Scorer> scorers, Scorer filter) throws IOException {
@@ -190,6 +191,8 @@ final class MaxScoreBulkScorer extends BulkScorer {
         // The first half of the window would match a single clause. Let's collect this single
         // clause until the next doc ID of the next clause.
         scoreInnerWindowSingleEssentialClause(collector, acceptDocs, Math.min(max, top2.doc));
+      } else if (essentialQueue.size() == 2 && top2.doc < max) {
+        scoreInnerWindowTwoEssentialClauses(collector, acceptDocs, max, top, top2);
       } else {
         scoreInnerWindowMultipleEssentialClauses(collector, acceptDocs, max);
       }
@@ -350,6 +353,56 @@ final class MaxScoreBulkScorer extends BulkScorer {
 
     top.doc = top.iterator.docID();
     essentialQueue.updateTop();
+  }
+
+  private void scoreInnerWindowTwoEssentialClauses(
+      LeafCollector collector, Bits acceptDocs, int max, DisiWrapper first, DisiWrapper second)
+      throws IOException {
+    int upTo = MathUtil.unsignedMin(max, first.doc + INNER_WINDOW_SIZE);
+    if (secondDocAndScoreBuffer == null) {
+      secondDocAndScoreBuffer = new DocAndFloatFeatureBuffer();
+    }
+    DocAndFloatFeatureBuffer left = docAndScoreBuffer;
+    DocAndFloatFeatureBuffer right = secondDocAndScoreBuffer;
+    first.scorer.nextDocsAndScores(upTo, acceptDocs, left);
+    second.scorer.nextDocsAndScores(upTo, acceptDocs, right);
+
+    // Merge the two sorted streams as their batches become available.
+    docAndScoreAccBuffer.growNoCopy(upTo - first.doc);
+    int size = 0;
+    int leftIndex = 0;
+    int rightIndex = 0;
+    while (leftIndex < left.size || rightIndex < right.size) {
+      int leftDoc = leftIndex < left.size ? left.docs[leftIndex] : DocIdSetIterator.NO_MORE_DOCS;
+      int rightDoc =
+          rightIndex < right.size ? right.docs[rightIndex] : DocIdSetIterator.NO_MORE_DOCS;
+      int doc = Math.min(leftDoc, rightDoc);
+      double score = 0;
+      if (leftDoc == doc) {
+        score += left.features[leftIndex++];
+        if (leftIndex == left.size && first.iterator.docID() < upTo) {
+          first.scorer.nextDocsAndScores(upTo, acceptDocs, left);
+          leftIndex = 0;
+        }
+      }
+      if (rightDoc == doc) {
+        score += right.features[rightIndex++];
+        if (rightIndex == right.size && second.iterator.docID() < upTo) {
+          second.scorer.nextDocsAndScores(upTo, acceptDocs, right);
+          rightIndex = 0;
+        }
+      }
+      docAndScoreAccBuffer.docs[size] = doc;
+      docAndScoreAccBuffer.scores[size++] = score;
+    }
+    docAndScoreAccBuffer.size = size;
+
+    // Updating the first scorer brings the second (still before upTo) to the top of the queue.
+    first.doc = first.iterator.docID();
+    essentialQueue.updateTop();
+    second.doc = second.iterator.docID();
+    essentialQueue.updateTop();
+    scoreNonEssentialClauses(collector, docAndScoreAccBuffer, firstEssentialScorer);
   }
 
   private void scoreInnerWindowMultipleEssentialClauses(

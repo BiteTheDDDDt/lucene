@@ -68,6 +68,48 @@ public class TestMaxScoreBulkScorer extends LuceneTestCase {
     }
   }
 
+  public void testEssentialClausesAcrossBatches() throws IOException {
+    String[] terms = {"left", "right", "third", "fourth", "fifth"};
+    try (Directory dir = newDirectory();
+        IndexWriter writer = new IndexWriter(dir, newIndexWriterConfig())) {
+      for (int i = 0; i < 5000; ++i) {
+        Document doc = new Document();
+        for (int j = 0; j < terms.length; ++j) {
+          if (i % (j + 2) != 0) {
+            String term = terms[j];
+            doc.add(new TextField("body", i % (j + 5) == 0 ? term + " " + term : term, Store.NO));
+          }
+        }
+        if (i >= 128 && i < 768) {
+          doc.add(new StringField("deleted", "yes", Store.NO));
+        }
+        writer.addDocument(doc);
+      }
+      writer.forceMerge(1);
+      writer.deleteDocuments(new Term("deleted", "yes"));
+      try (DirectoryReader reader = DirectoryReader.open(writer)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+        for (int clauseCount : new int[] {2, 3, 5}) {
+          BooleanQuery.Builder builder = new BooleanQuery.Builder();
+          for (int i = 0; i < clauseCount; ++i) {
+            builder.add(new TermQuery(new Term("body", terms[i])), Occur.SHOULD);
+          }
+          Query query = builder.build();
+          for (int k : new int[] {10, reader.numDocs()}) {
+            TopDocs expected =
+                searcher.search(query, new TopScoreDocCollectorManager(k, Integer.MAX_VALUE));
+            TopDocs actual = searcher.search(query, k);
+            assertEquals(expected.scoreDocs.length, actual.scoreDocs.length);
+            for (int i = 0; i < expected.scoreDocs.length; ++i) {
+              assertEquals(expected.scoreDocs[i].doc, actual.scoreDocs[i].doc);
+              assertEquals(expected.scoreDocs[i].score, actual.scoreDocs[i].score, 0f);
+            }
+          }
+        }
+      }
+    }
+  }
+
   public void testBasicsWithTwoDisjunctionClauses() throws Exception {
     try (Directory dir = newDirectory()) {
       writeDocuments(dir);
